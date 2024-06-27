@@ -115,6 +115,10 @@ impl<N: Network> StackExecute<N> for Stack<N> {
                     Operand::BlockHeight => {
                         bail!("Illegal operation: cannot retrieve the block height in a closure scope")
                     }
+                    // If the operand is the network id, throw an error.
+                    Operand::NetworkID => {
+                        bail!("Illegal operation: cannot retrieve the network id in a closure scope")
+                    }
                 }
             })
             .collect();
@@ -140,13 +144,16 @@ impl<N: Network> StackExecute<N> for Stack<N> {
     ) -> Result<Response<N>> {
         let timer = timer!("Stack::execute_function");
 
+        // Ensure the global constants for the Aleo environment are initialized.
+        A::initialize_global_constants();
         // Ensure the circuit environment is clean.
         A::reset();
 
-        // If in 'CheckDeployment' mode, set the constraint limit.
+        // If in 'CheckDeployment' mode, set the constraint limit and variable limit.
         // We do not have to reset it after function calls because `CheckDeployment` mode does not execute those.
-        if let CallStack::CheckDeployment(_, _, _, constraint_limit) = &call_stack {
+        if let CallStack::CheckDeployment(_, _, _, constraint_limit, variable_limit) = &call_stack {
             A::set_constraint_limit(*constraint_limit);
+            A::set_variable_limit(*variable_limit);
         }
 
         // Retrieve the next request.
@@ -343,6 +350,10 @@ impl<N: Network> StackExecute<N> for Stack<N> {
                     Operand::BlockHeight => {
                         bail!("Illegal operation: cannot retrieve the block height in a function scope")
                     }
+                    // If the operand is the network id, throw an error.
+                    Operand::NetworkID => {
+                        bail!("Illegal operation: cannot retrieve the network id in a function scope")
+                    }
                 }
             })
             .collect::<Result<Vec<_>>>()?;
@@ -437,7 +448,7 @@ impl<N: Network> StackExecute<N> for Stack<N> {
             lap!(timer, "Save the transition");
         }
         // If the circuit is in `CheckDeployment` mode, then save the assignment.
-        else if let CallStack::CheckDeployment(_, _, ref assignments, _) = registers.call_stack() {
+        else if let CallStack::CheckDeployment(_, _, ref assignments, _, _) = registers.call_stack() {
             // Construct the call metrics.
             let metrics = CallMetrics {
                 program_id: *self.program_id(),

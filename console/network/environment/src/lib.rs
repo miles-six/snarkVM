@@ -66,6 +66,7 @@ pub mod prelude {
         cfg_into_iter,
         cfg_iter,
         cfg_iter_mut,
+        cfg_keys,
         cfg_reduce,
         cfg_values,
         error,
@@ -75,6 +76,7 @@ pub mod prelude {
         FromBits as _,
         FromBytes,
         FromBytesDeserializer,
+        LimitedWriter,
         TestRng,
         ToBits as _,
         ToBytes,
@@ -135,7 +137,7 @@ pub mod prelude {
     };
     pub use serde::{
         de,
-        de::{DeserializeOwned, SeqAccess, Visitor},
+        de::{DeserializeOwned, EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor},
         ser::{self, SerializeSeq, SerializeStruct},
         Deserialize,
         Deserializer,

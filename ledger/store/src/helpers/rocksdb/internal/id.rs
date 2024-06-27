@@ -59,6 +59,7 @@ impl From<MapID> for u16 {
 #[repr(u16)]
 pub enum BFTMap {
     Transmissions = DataID::BFTTransmissionsMap as u16,
+    AbortedTransmissionIDs = DataID::BFTAbortedTransmissionIDsMap as u16,
 }
 
 /// The RocksDB map prefix for block-related entries.
@@ -76,7 +77,7 @@ pub enum BlockMap {
     Certificate = DataID::BlockCertificateMap as u16,
     Ratifications = DataID::BlockRatificationsMap as u16,
     Solutions = DataID::BlockSolutionsMap as u16,
-    PuzzleCommitments = DataID::BlockPuzzleCommitmentsMap as u16,
+    PuzzleCommitments = DataID::BlockSolutionIDsMap as u16,
     AbortedSolutionIDs = DataID::BlockAbortedSolutionIDsMap as u16,
     AbortedSolutionHeights = DataID::BlockAbortedSolutionHeightsMap as u16,
     Transactions = DataID::BlockTransactionsMap as u16,
@@ -222,6 +223,7 @@ pub enum TestMap {
 enum DataID {
     // BFT
     BFTTransmissionsMap,
+    BFTAbortedTransmissionIDsMap,
     // Block
     BlockStateRootMap,
     BlockReverseStateRootMap,
@@ -232,7 +234,7 @@ enum DataID {
     BlockCertificateMap,
     BlockRatificationsMap,
     BlockSolutionsMap,
-    BlockPuzzleCommitmentsMap,
+    BlockSolutionIDsMap,
     BlockAbortedSolutionIDsMap,
     BlockAbortedSolutionHeightsMap,
     BlockTransactionsMap,

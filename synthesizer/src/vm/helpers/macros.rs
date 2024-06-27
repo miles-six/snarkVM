@@ -54,6 +54,29 @@ macro_rules! cast_mut_ref {
 
 /// A helper macro to dedup the `Network` trait and `Aleo` trait and process its given logic.
 #[macro_export]
+macro_rules! convert {
+    // Example: convert!(logic)
+    ($logic:ident) => {{
+        match N::ID {
+            console::network::MainnetV0::ID => {
+                // Process the logic.
+                $logic!(console::network::MainnetV0, circuit::AleoV0)
+            }
+            console::network::TestnetV0::ID => {
+                // Process the logic.
+                $logic!(console::network::TestnetV0, circuit::AleoTestnetV0)
+            }
+            console::network::CanaryV0::ID => {
+                // Process the logic.
+                $logic!(console::network::CanaryV0, circuit::AleoCanaryV0)
+            }
+            _ => bail!("Unsupported VM configuration for network: {}", N::ID),
+        }
+    }};
+}
+
+/// A helper macro to dedup the `Network` trait and `Aleo` trait and process its given logic.
+#[macro_export]
 macro_rules! process {
     // Example: process!(self, logic)
     ($self:ident, $logic:ident) => {{
@@ -65,6 +88,22 @@ macro_rules! process {
                     .ok_or_else(|| anyhow!("Failed to downcast {}", stringify!($self.process)))?;
                 // Process the logic.
                 $logic!(process.read(), console::network::MainnetV0, circuit::AleoV0)
+            }
+            console::network::TestnetV0::ID => {
+                // Cast the process.
+                let process = (&$self.process as &dyn std::any::Any)
+                    .downcast_ref::<Arc<RwLock<Process<console::network::TestnetV0>>>>()
+                    .ok_or_else(|| anyhow!("Failed to downcast {}", stringify!($self.process)))?;
+                // Process the logic.
+                $logic!(process.read(), console::network::TestnetV0, circuit::AleoTestnetV0)
+            }
+            console::network::CanaryV0::ID => {
+                // Cast the process.
+                let process = (&$self.process as &dyn std::any::Any)
+                    .downcast_ref::<Arc<RwLock<Process<console::network::CanaryV0>>>>()
+                    .ok_or_else(|| anyhow!("Failed to downcast {}", stringify!($self.process)))?;
+                // Process the logic.
+                $logic!(process.read(), console::network::CanaryV0, circuit::AleoCanaryV0)
             }
             _ => bail!("Unsupported VM configuration for network: {}", N::ID),
         }

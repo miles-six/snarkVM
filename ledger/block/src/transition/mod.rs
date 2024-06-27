@@ -311,17 +311,26 @@ impl<N: Network> Transition<N> {
     /// Returns `true` if this is a `bond_public` transition.
     #[inline]
     pub fn is_bond_public(&self) -> bool {
-        self.inputs.len() == 2
-            && self.outputs.is_empty()
+        self.inputs.len() == 3
+            && self.outputs.len() == 1
             && self.program_id.to_string() == "credits.aleo"
             && self.function_name.to_string() == "bond_public"
+    }
+
+    /// Returns `true` if this is a `bond_validator` transition.
+    #[inline]
+    pub fn is_bond_validator(&self) -> bool {
+        self.inputs.len() == 3
+            && self.outputs.len() == 1
+            && self.program_id.to_string() == "credits.aleo"
+            && self.function_name.to_string() == "bond_validator"
     }
 
     /// Returns `true` if this is an `unbond_public` transition.
     #[inline]
     pub fn is_unbond_public(&self) -> bool {
         self.inputs.len() == 2
-            && self.outputs.is_empty()
+            && self.outputs.len() == 1
             && self.program_id.to_string() == "credits.aleo"
             && self.function_name.to_string() == "unbond_public"
     }

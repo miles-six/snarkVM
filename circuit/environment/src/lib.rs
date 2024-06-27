@@ -19,6 +19,9 @@ extern crate snarkvm_circuit_environment_witness;
 
 pub use snarkvm_circuit_environment_witness::rename_selfs;
 
+pub mod canary_circuit;
+pub use canary_circuit::*;
+
 pub mod circuit;
 pub use circuit::*;
 
@@ -31,6 +34,9 @@ pub use helpers::*;
 pub mod macros;
 #[allow(unused_imports)]
 pub use macros::*;
+
+pub mod testnet_circuit;
+pub use testnet_circuit::*;
 
 pub mod traits;
 pub use traits::*;

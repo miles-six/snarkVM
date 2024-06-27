@@ -18,11 +18,11 @@ edition = "2021"
 
 [features]
 default = [ "indexmap/rayon", "rayon" ]
-rocks = [ "once_cell", "rocksdb", "tracing" ]
+rocks = [ "once_cell", "rocksdb", "smallvec", "tracing" ]
 serial = [
   "console/serial",
   "ledger-block/serial",
-  "ledger-coinbase/serial",
+  "ledger-puzzle/serial",
   "ledger-committee/serial",
   "synthesizer-program/serial",
   "synthesizer-snark/serial"
@@ -31,7 +31,7 @@ wasm = [
   "console/wasm",
   "ledger-authority/wasm",
   "ledger-block/wasm",
-  "ledger-coinbase/wasm",
+  "ledger-puzzle/wasm",
   "ledger-committee/wasm",
   "ledger-narwhal-batch-certificate/wasm",
   "synthesizer-program/wasm",
@@ -54,11 +54,6 @@ package = "snarkvm-ledger-block"
 path = "../block"
 version = "=0.16.19"
 
-[dependencies.ledger-coinbase]
-package = "snarkvm-ledger-coinbase"
-path = "../coinbase"
-version = "=0.16.19"
-
 [dependencies.ledger-committee]
 package = "snarkvm-ledger-committee"
 path = "../committee"
@@ -67,6 +62,11 @@ version = "=0.16.19"
 [dependencies.ledger-narwhal-batch-certificate]
 package = "snarkvm-ledger-narwhal-batch-certificate"
 path = "../narwhal/batch-certificate"
+version = "=0.16.19"
+
+[dependencies.ledger-puzzle]
+package = "snarkvm-ledger-puzzle"
+path = "../puzzle"
 version = "=0.16.19"
 
 [dependencies.synthesizer-program]
@@ -116,6 +116,12 @@ version = "1.0"
 [dependencies.serde_json]
 version = "1.0"
 features = [ "preserve_order" ]
+
+[dependencies.smallvec]
+version = "1.11"
+default-features = false
+features = [ "write" ]
+optional = true
 
 [dependencies.tracing]
 version = "0.1"

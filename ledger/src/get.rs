@@ -35,16 +35,16 @@ impl<N: Network, C: ConsensusStorage<N>> Ledger<N, C> {
         self.vm.block_store().get_state_path_for_commitment(commitment)
     }
 
-    /// Returns the epoch challenge for the given block height.
-    pub fn get_epoch_challenge(&self, block_height: u32) -> Result<EpochChallenge<N>> {
+    /// Returns the epoch hash for the given block height.
+    pub fn get_epoch_hash(&self, block_height: u32) -> Result<N::BlockHash> {
         // Compute the epoch number from the current block height.
-        let epoch_number = block_height / N::NUM_BLOCKS_PER_EPOCH;
+        let epoch_number = block_height.saturating_div(N::NUM_BLOCKS_PER_EPOCH);
         // Compute the epoch starting height (a multiple of `NUM_BLOCKS_PER_EPOCH`).
-        let epoch_starting_height = epoch_number * N::NUM_BLOCKS_PER_EPOCH;
-        // Retrieve the epoch block hash, defined as the 'previous block hash' from the epoch starting height.
-        let epoch_block_hash = self.get_previous_hash(epoch_starting_height)?;
-        // Construct the epoch challenge.
-        EpochChallenge::new(epoch_number, epoch_block_hash, N::COINBASE_PUZZLE_DEGREE)
+        let epoch_starting_height = epoch_number.saturating_mul(N::NUM_BLOCKS_PER_EPOCH);
+        // Retrieve the epoch hash, defined as the 'previous block hash' from the epoch starting height.
+        let epoch_hash = self.get_previous_hash(epoch_starting_height)?;
+        // Construct the epoch hash.
+        Ok(epoch_hash)
     }
 
     /// Returns the block for the given block height.
@@ -215,7 +215,7 @@ impl<N: Network, C: ConsensusStorage<N>> Ledger<N, C> {
     }
 
     /// Returns the solution for the given solution ID.
-    pub fn get_solution(&self, solution_id: &PuzzleCommitment<N>) -> Result<ProverSolution<N>> {
+    pub fn get_solution(&self, solution_id: &SolutionID<N>) -> Result<Solution<N>> {
         self.vm.block_store().get_solution(solution_id)
     }
 
@@ -240,6 +240,39 @@ impl<N: Network, C: ConsensusStorage<N>> Ledger<N, C> {
     /// Returns the batch certificate for the given `certificate ID`.
     pub fn get_batch_certificate(&self, certificate_id: &Field<N>) -> Result<Option<BatchCertificate<N>>> {
         self.vm.block_store().get_batch_certificate(certificate_id)
+    }
+
+    /// Returns the delegators for the given validator.
+    pub fn get_delegators_for_validator(&self, validator: &Address<N>) -> Result<Vec<Address<N>>> {
+        // Construct the credits.aleo program ID.
+        let credits_program_id = ProgramID::from_str("credits.aleo")?;
+        // Construct the bonded mapping name.
+        let bonded_mapping = Identifier::from_str("bonded")?;
+        // Construct the bonded mapping key name.
+        let bonded_mapping_key = Identifier::from_str("validator")?;
+        // Get the credits.aleo bonded mapping.
+        let bonded = self.vm.finalize_store().get_mapping_confirmed(credits_program_id, bonded_mapping)?;
+        // Select the delegators for the given validator.
+        cfg_into_iter!(bonded)
+            .filter_map(|(bonded_address, bond_state)| {
+                let Plaintext::Literal(Literal::Address(bonded_address), _) = bonded_address else {
+                    return Some(Err(anyhow!("Invalid delegator in finalize storage.")));
+                };
+                let Value::Plaintext(Plaintext::Struct(bond_state, _)) = bond_state else {
+                    return Some(Err(anyhow!("Invalid bond_state in finalize storage.")));
+                };
+                let Some(mapping_validator) = bond_state.get(&bonded_mapping_key) else {
+                    return Some(Err(anyhow!("Invalid bond_state validator in finalize storage.")));
+                };
+                let Plaintext::Literal(Literal::Address(mapping_validator), _) = mapping_validator else {
+                    return Some(Err(anyhow!("Invalid validator in finalize storage.")));
+                };
+                // Select bonded addresses which:
+                // 1. are bonded to the right validator.
+                // 2. are not themselves the validator.
+                (mapping_validator == validator && bonded_address != *validator).then_some(Ok(bonded_address))
+            })
+            .collect::<Result<_>>()
     }
 }
 

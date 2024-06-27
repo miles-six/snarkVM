@@ -32,6 +32,38 @@ macro_rules! ensure_is_unique {
 }
 
 impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+    /// The maximum number of deployments to verify in parallel.
+    pub(crate) const MAX_PARALLEL_DEPLOY_VERIFICATIONS: usize = 5;
+    /// The maximum number of executions to verify in parallel.
+    pub(crate) const MAX_PARALLEL_EXECUTE_VERIFICATIONS: usize = 1000;
+
+    /// Verifies the list of transactions in the VM. On failure, returns an error.
+    pub fn check_transactions<R: CryptoRng + Rng>(
+        &self,
+        transactions: &[(&Transaction<N>, Option<Field<N>>)],
+        rng: &mut R,
+    ) -> Result<()> {
+        // Separate the transactions into deploys and executions.
+        let (deployments, executions): (Vec<_>, Vec<_>) = transactions.iter().partition(|(tx, _)| tx.is_deploy());
+        // Chunk the deploys and executions into groups for parallel verification.
+        let deployments_for_verification = deployments.chunks(Self::MAX_PARALLEL_DEPLOY_VERIFICATIONS);
+        let executions_for_verification = executions.chunks(Self::MAX_PARALLEL_EXECUTE_VERIFICATIONS);
+
+        // Verify the transactions in batches.
+        for transactions in deployments_for_verification.chain(executions_for_verification) {
+            // Ensure each transaction is well-formed and unique.
+            let rngs = (0..transactions.len()).map(|_| StdRng::from_seed(rng.gen())).collect::<Vec<_>>();
+            cfg_iter!(transactions).zip(rngs).try_for_each(|((transaction, rejected_id), mut rng)| {
+                self.check_transaction(transaction, *rejected_id, &mut rng)
+                    .map_err(|e| anyhow!("Invalid transaction found in the transactions list: {e}"))
+            })?;
+        }
+
+        Ok(())
+    }
+}
+
+impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
     /// Verifies the transaction in the VM. On failure, returns an error.
     #[inline]
     pub fn check_transaction<R: CryptoRng + Rng>(
@@ -43,6 +75,13 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
         let timer = timer!("VM::check_transaction");
 
         /* Transaction */
+
+        // Allocate a buffer to write the transaction.
+        let mut buffer = Vec::with_capacity(N::MAX_TRANSACTION_SIZE);
+        // Ensure that the transaction is well formed and does not exceed the maximum size.
+        if let Err(error) = transaction.write_le(LimitedWriter::new(&mut buffer, N::MAX_TRANSACTION_SIZE)) {
+            bail!("Transaction '{}' is not well-formed: {error}", transaction.id())
+        }
 
         // Ensure the transaction ID is unique.
         if self.block_store().contains_transaction_id(&transaction.id())? {
@@ -121,7 +160,11 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
                 }
                 // Verify the deployment if it has not been verified before.
                 if !is_partially_verified {
-                    self.check_deployment_internal(deployment, rng)?;
+                    // Verify the deployment.
+                    match try_vm_runtime!(|| self.check_deployment_internal(deployment, rng)) {
+                        Ok(result) => result?,
+                        Err(_) => bail!("VM safely halted transaction '{id}' during verification"),
+                    }
                 }
             }
             Transaction::Execute(id, execution, _) => {
@@ -134,7 +177,10 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
                     bail!("Transaction '{id}' contains a previously rejected execution")
                 }
                 // Verify the execution.
-                self.check_execution_internal(execution, is_partially_verified)?;
+                match try_vm_runtime!(|| self.check_execution_internal(execution, is_partially_verified)) {
+                    Ok(result) => result?,
+                    Err(_) => bail!("VM safely halted transaction '{id}' during verification"),
+                }
             }
             Transaction::Fee(..) => { /* no-op */ }
         }
@@ -246,6 +292,14 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
     #[inline]
     fn check_execution_internal(&self, execution: &Execution<N>, is_partially_verified: bool) -> Result<()> {
         let timer = timer!("VM::check_execution");
+
+        // Retrieve the block height.
+        let block_height = self.block_store().current_block_height();
+
+        // Ensure the execution does not contain any restricted transitions.
+        if self.restrictions.contains_restricted_transitions(execution, block_height) {
+            bail!("Execution verification failed - restricted transition found");
+        }
 
         // Verify the execution proof, if it has not been partially-verified before.
         let verification = match is_partially_verified {
@@ -489,7 +543,7 @@ mod tests {
 
         // Construct the new block header.
         let (ratifications, transactions, aborted_transaction_ids, ratified_finalize_operations) = vm
-            .speculate(sample_finalize_state(1), Some(0u64), vec![], &None.into(), [deployment_transaction].iter())
+            .speculate(sample_finalize_state(1), Some(0u64), vec![], &None.into(), [deployment_transaction].iter(), rng)
             .unwrap();
         assert!(aborted_transaction_ids.is_empty());
 

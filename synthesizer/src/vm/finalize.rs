@@ -14,10 +14,13 @@
 
 use super::*;
 
-use ledger_committee::{MAX_DELEGATORS, MIN_DELEGATOR_STAKE, MIN_VALIDATOR_STAKE};
+use ledger_committee::{MAX_DELEGATORS, MIN_DELEGATOR_STAKE, MIN_VALIDATOR_SELF_STAKE};
+use utilities::cfg_sort_by_cached_key;
 
 impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
     /// Speculates on the given list of transactions in the VM.
+    /// This function aborts all transactions that are not are well-formed or unique.
+    ///
     ///
     /// Returns the confirmed transactions, aborted transaction IDs,
     /// and finalize operations from pre-ratify and post-ratify.
@@ -28,32 +31,58 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
     ///     `Ratify::BlockReward(block_reward)` and `Ratify::PuzzleReward(puzzle_reward)`
     ///     to the front of the `ratifications` list.
     #[inline]
-    pub fn speculate<'a>(
+    pub fn speculate<'a, R: Rng + CryptoRng>(
         &self,
         state: FinalizeGlobalState,
         coinbase_reward: Option<u64>,
         candidate_ratifications: Vec<Ratify<N>>,
         candidate_solutions: &Solutions<N>,
         candidate_transactions: impl ExactSizeIterator<Item = &'a Transaction<N>>,
+        rng: &mut R,
     ) -> Result<(Ratifications<N>, Transactions<N>, Vec<N::TransactionID>, Vec<FinalizeOperation<N>>)> {
         let timer = timer!("VM::speculate");
 
+        // Collect the candidate transactions into a vector.
+        let candidate_transactions: Vec<_> = candidate_transactions.collect::<Vec<_>>();
+        let candidate_transaction_ids: Vec<_> = candidate_transactions.iter().map(|tx| tx.id()).collect();
+
+        // Determine if the vm is currently processing the genesis block.
+        let is_genesis =
+            self.block_store().find_block_height_from_state_root(self.block_store().current_state_root())?.is_none();
+        // If the transactions are not part of the genesis block, ensure each transaction is well-formed and unique. Abort any transactions that are not.
+        let (verified_transactions, verification_aborted_transactions) = match is_genesis {
+            // If the current state root does not exist in the block store, then the genesis block has not been introduced yet.
+            true => (candidate_transactions, vec![]),
+            // Verify transactions for all non-genesis cases.
+            false => self.prepare_for_speculate(&candidate_transactions, rng)?,
+        };
+
         // Performs a **dry-run** over the list of ratifications, solutions, and transactions.
-        let (ratifications, confirmed_transactions, aborted_transactions, ratified_finalize_operations) = self
-            .atomic_speculate(
+        let (ratifications, confirmed_transactions, speculation_aborted_transactions, ratified_finalize_operations) =
+            self.atomic_speculate(
                 state,
                 coinbase_reward,
                 candidate_ratifications,
                 candidate_solutions,
-                candidate_transactions,
+                verified_transactions.into_iter(),
             )?;
 
-        // Convert the aborted transactions into aborted transaction IDs.
-        let mut aborted_transaction_ids = Vec::with_capacity(aborted_transactions.len());
-        for (tx, error) in aborted_transactions {
-            warn!("Speculation safely aborted a transaction - {error} ({})", tx.id());
-            aborted_transaction_ids.push(tx.id());
-        }
+        // Get the aborted transaction ids.
+        let verification_aborted_transaction_ids = verification_aborted_transactions.iter().map(|(tx, e)| (tx.id(), e));
+        let speculation_aborted_transaction_ids = speculation_aborted_transactions.iter().map(|(tx, e)| (tx.id(), e));
+        let unordered_aborted_transaction_ids: IndexMap<N::TransactionID, &String> =
+            verification_aborted_transaction_ids.chain(speculation_aborted_transaction_ids).collect();
+
+        // Filter and order the aborted transaction ids according to candidate_transactions
+        let aborted_transaction_ids: Vec<_> = candidate_transaction_ids
+            .into_iter()
+            .filter_map(|tx_id| {
+                unordered_aborted_transaction_ids.get(&tx_id).map(|error| {
+                    warn!("Speculation safely aborted a transaction - {error} ({tx_id})");
+                    tx_id
+                })
+            })
+            .collect();
 
         finish!(timer, "Finished dry-run of the transactions");
 
@@ -67,17 +96,29 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
     }
 
     /// Checks the speculation on the given transactions in the VM.
+    /// This function also ensure that the given transactions are well-formed and unique.
     ///
     /// Returns the finalize operations from pre-ratify and post-ratify.
     #[inline]
-    pub fn check_speculate(
+    pub fn check_speculate<R: Rng + CryptoRng>(
         &self,
         state: FinalizeGlobalState,
         ratifications: &Ratifications<N>,
         solutions: &Solutions<N>,
         transactions: &Transactions<N>,
+        rng: &mut R,
     ) -> Result<Vec<FinalizeOperation<N>>> {
         let timer = timer!("VM::check_speculate");
+
+        // Retrieve the transactions and their rejected IDs.
+        let transactions_and_rejected_ids = cfg_iter!(transactions)
+            .map(|transaction| transaction.to_rejected_id().map(|rejected_id| (transaction.deref(), rejected_id)))
+            .collect::<Result<Vec<_>>>()?;
+        // Ensure each transaction is well-formed and unique.
+        // NOTE: We perform the transaction checks here prior to `atomic_speculate` because we must
+        // ensure that the `Fee` transactions are valid. We can't unify the transaction checks in `atomic_speculate`
+        // because we run speculation on the unconfirmed variant of the transactions.
+        self.check_transactions(&transactions_and_rejected_ids, rng)?;
 
         // Reconstruct the candidate ratifications to verify the speculation.
         let candidate_ratifications = ratifications.iter().cloned().collect::<Vec<_>>();
@@ -134,7 +175,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
     #[cfg(not(any(test, feature = "test")))]
     pub const MAXIMUM_CONFIRMED_TRANSACTIONS: usize = Transactions::<N>::MAX_TRANSACTIONS;
     /// The maximum number of confirmed transactions allowed in a block.
-    /// This is set to a deliberately low value (8) for testing purposes only.
+    /// This is deliberately set to a low value (8) for testing purposes only.
     #[cfg(any(test, feature = "test"))]
     pub const MAXIMUM_CONFIRMED_TRANSACTIONS: usize = 8;
 
@@ -242,6 +283,8 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
             let mut output_ids: IndexSet<Field<N>> = IndexSet::new();
             // Initialize the list of created transition public keys.
             let mut tpks: IndexSet<Group<N>> = IndexSet::new();
+            // Initialize the list of deployment payers.
+            let mut deployment_payers: IndexSet<Address<N>> = IndexSet::new();
 
             // Finalize the transactions.
             'outer: for transaction in transactions {
@@ -254,55 +297,19 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
                     continue 'outer;
                 }
 
-                // Ensure that the transaction is not producing a duplicate transition.
-                for transition_id in transaction.transition_ids() {
-                    // If the transition ID is already produced in this block or previous blocks, abort the transaction.
-                    if transition_ids.contains(transition_id)
-                        || self.transition_store().contains_transition_id(transition_id).unwrap_or(true)
-                    {
-                        // Store the aborted transaction.
-                        aborted.push((transaction.clone(), format!("Duplicate transition {transition_id}")));
-                        // Continue to the next transaction.
-                        continue 'outer;
-                    }
-                }
-
-                // Ensure that the transaction is not double-spending an input.
-                for input_id in transaction.input_ids() {
-                    // If the input ID is already spent in this block or previous blocks, abort the transaction.
-                    if input_ids.contains(input_id)
-                        || self.transition_store().contains_input_id(input_id).unwrap_or(true)
-                    {
-                        // Store the aborted transaction.
-                        aborted.push((transaction.clone(), format!("Double-spending input {input_id}")));
-                        // Continue to the next transaction.
-                        continue 'outer;
-                    }
-                }
-
-                // Ensure that the transaction is not producing a duplicate output.
-                for output_id in transaction.output_ids() {
-                    // If the output ID is already produced in this block or previous blocks, abort the transaction.
-                    if output_ids.contains(output_id)
-                        || self.transition_store().contains_output_id(output_id).unwrap_or(true)
-                    {
-                        // Store the aborted transaction.
-                        aborted.push((transaction.clone(), format!("Duplicate output {output_id}")));
-                        // Continue to the next transaction.
-                        continue 'outer;
-                    }
-                }
-
-                // // Ensure that the transaction is not producing a duplicate transition public key.
-                // // Note that the tpk and tcm are corresponding, so a uniqueness check for just the tpk is sufficient.
-                for tpk in transaction.transition_public_keys() {
-                    // If the transition public key is already produced in this block or previous blocks, abort the transaction.
-                    if tpks.contains(tpk) || self.transition_store().contains_tpk(tpk).unwrap_or(true) {
-                        // Store the aborted transaction.
-                        aborted.push((transaction.clone(), format!("Duplicate transition public key {tpk}")));
-                        // Continue to the next transaction.
-                        continue 'outer;
-                    }
+                // Determine if the transaction should be aborted.
+                if let Some(reason) = self.should_abort_transaction(
+                    transaction,
+                    &transition_ids,
+                    &input_ids,
+                    &output_ids,
+                    &tpks,
+                    &deployment_payers,
+                ) {
+                    // Store the aborted transaction.
+                    aborted.push((transaction.clone(), reason));
+                    // Continue to the next transaction.
+                    continue 'outer;
                 }
 
                 // Process the transaction in an isolated atomic batch.
@@ -372,7 +379,10 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
                     // The finalize operation here involves calling 'update_key_value',
                     // and update the respective leaves of the finalize tree.
                     Transaction::Execute(_, execution, fee) => {
-                        match process.finalize_execution(state, store, execution, fee.as_ref()) {
+                        // Determine if the transaction is safe for execution, and proceed to execute it.
+                        match Self::prepare_for_execution(store, execution)
+                            .and_then(|_| process.finalize_execution(state, store, execution, fee.as_ref()))
+                        {
                             // Construct the accepted execute transaction.
                             Ok(finalize) => {
                                 ConfirmedTransaction::accepted_execute(counter, transaction.clone(), finalize)
@@ -426,6 +436,10 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
                         output_ids.extend(confirmed_transaction.transaction().output_ids());
                         // Add the transition public keys to the set of produced transition public keys.
                         tpks.extend(confirmed_transaction.transaction().transition_public_keys());
+                        // Add any public deployment payer to the set of deployment payers.
+                        if let Transaction::Deploy(_, _, _, fee) = confirmed_transaction.transaction() {
+                            fee.payer().map(|payer| deployment_payers.insert(payer));
+                        }
                         // Store the confirmed transaction.
                         confirmed.push(confirmed_transaction);
                         // Increment the transaction index counter.
@@ -481,7 +495,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
             let post_ratifications = reward_ratifications.iter().chain(post_ratifications);
 
             // Process the post-ratifications.
-            match Self::atomic_post_ratify(store, state, post_ratifications, solutions) {
+            match Self::atomic_post_ratify::<false>(&self.puzzle, store, state, post_ratifications, solutions) {
                 // Store the finalize operations from the post-ratify.
                 Ok(operations) => ratified_finalize_operations.extend(operations),
                 // Note: This will abort the entire atomic batch.
@@ -725,7 +739,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
 
             /* Perform the ratifications after finalize. */
 
-            match Self::atomic_post_ratify(store, state, post_ratifications, solutions) {
+            match Self::atomic_post_ratify::<true>(&self.puzzle, store, state, post_ratifications, solutions) {
                 // Store the finalize operations from the post-ratify.
                 Ok(operations) => ratified_finalize_operations.extend(operations),
                 // Note: This will abort the entire atomic batch.
@@ -745,6 +759,234 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
         })
     }
 
+    /// Returns `Some(reason)` if the transaction is aborted. Otherwise, returns `None`.
+    ///
+    /// The transaction will be aborted if any of the following conditions are met:
+    /// - The transaction is producing a duplicate transition
+    /// - The transaction is double-spending an input
+    /// - The transaction is producing a duplicate output
+    /// - The transaction is producing a duplicate transition public key
+    /// - The transaction is another deployment in the block from the same public fee payer.
+    fn should_abort_transaction(
+        &self,
+        transaction: &Transaction<N>,
+        transition_ids: &IndexSet<N::TransitionID>,
+        input_ids: &IndexSet<Field<N>>,
+        output_ids: &IndexSet<Field<N>>,
+        tpks: &IndexSet<Group<N>>,
+        deployment_payers: &IndexSet<Address<N>>,
+    ) -> Option<String> {
+        // Ensure that the transaction is not producing a duplicate transition.
+        for transition_id in transaction.transition_ids() {
+            // If the transition ID is already produced in this block or previous blocks, abort the transaction.
+            if transition_ids.contains(transition_id)
+                || self.transition_store().contains_transition_id(transition_id).unwrap_or(true)
+            {
+                return Some(format!("Duplicate transition {transition_id}"));
+            }
+        }
+
+        // Ensure that the transaction is not double-spending an input.
+        for input_id in transaction.input_ids() {
+            // If the input ID is already spent in this block or previous blocks, abort the transaction.
+            if input_ids.contains(input_id) || self.transition_store().contains_input_id(input_id).unwrap_or(true) {
+                return Some(format!("Double-spending input {input_id}"));
+            }
+        }
+
+        // Ensure that the transaction is not producing a duplicate output.
+        for output_id in transaction.output_ids() {
+            // If the output ID is already produced in this block or previous blocks, abort the transaction.
+            if output_ids.contains(output_id) || self.transition_store().contains_output_id(output_id).unwrap_or(true) {
+                return Some(format!("Duplicate output {output_id}"));
+            }
+        }
+
+        // Ensure that the transaction is not producing a duplicate transition public key.
+        // Note that the tpk and tcm are corresponding, so a uniqueness check for just the tpk is sufficient.
+        for tpk in transaction.transition_public_keys() {
+            // If the transition public key is already produced in this block or previous blocks, abort the transaction.
+            if tpks.contains(tpk) || self.transition_store().contains_tpk(tpk).unwrap_or(true) {
+                return Some(format!("Duplicate transition public key {tpk}"));
+            }
+        }
+
+        // If the transaction is a deployment, ensure that it is not another deployment in the block from the same public fee payer.
+        if let Transaction::Deploy(_, _, _, fee) = transaction {
+            // If any public deployment payer has already deployed in this block, abort the transaction.
+            if let Some(payer) = fee.payer() {
+                if deployment_payers.contains(&payer) {
+                    return Some(format!("Another deployment in the block from the same public fee payer {payer}"));
+                }
+            }
+        }
+
+        // Return `None` because the transaction is well-formed.
+        None
+    }
+
+    /// Performs precondition checks on the transactions prior to speculation.
+    ///
+    /// This method is used to check the following conditions:
+    /// - If a transaction is a fee transaction or if it is invalid,
+    ///   then the transaction will be aborted.
+    pub(crate) fn prepare_for_speculate<'a, R: CryptoRng + Rng>(
+        &self,
+        transactions: &[&'a Transaction<N>],
+        rng: &mut R,
+    ) -> Result<(Vec<&'a Transaction<N>>, Vec<(&'a Transaction<N>, String)>)> {
+        // Construct the list of transactions that need to verified.
+        let mut transactions_to_verify = Vec::with_capacity(transactions.len());
+        // Construct the list of valid and invalid transactions.
+        let mut valid_transactions = Vec::with_capacity(transactions.len());
+        let mut aborted_transactions = Vec::with_capacity(transactions.len());
+
+        // Initialize a list of created transition IDs.
+        let mut transition_ids: IndexSet<N::TransitionID> = Default::default();
+        // Initialize a list of spent input IDs.
+        let mut input_ids: IndexSet<Field<N>> = Default::default();
+        // Initialize a list of created output IDs.
+        let mut output_ids: IndexSet<Field<N>> = Default::default();
+        // Initialize the list of created transition public keys.
+        let mut tpks: IndexSet<Group<N>> = Default::default();
+        // Initialize the list of deployment payers.
+        let mut deployment_payers: IndexSet<Address<N>> = Default::default();
+
+        // Abort the transactions that are have duplicates or are invalid. This will prevent the VM from performing
+        // verification on transactions that would have been aborted in `VM::atomic_speculate`.
+        for transaction in transactions.iter() {
+            // Abort the transaction early if it is a fee transaction.
+            if transaction.is_fee() {
+                aborted_transactions.push((*transaction, "Fee transactions are not allowed in speculate".to_string()));
+                continue;
+            }
+
+            // Determine if the transaction should be aborted.
+            match self.should_abort_transaction(
+                transaction,
+                &transition_ids,
+                &input_ids,
+                &output_ids,
+                &tpks,
+                &deployment_payers,
+            ) {
+                // Store the aborted transaction.
+                Some(reason) => aborted_transactions.push((*transaction, reason.to_string())),
+                // Track the transaction state.
+                None => {
+                    // Add the transition IDs to the set of produced transition IDs.
+                    transition_ids.extend(transaction.transition_ids());
+                    // Add the input IDs to the set of spent input IDs.
+                    input_ids.extend(transaction.input_ids());
+                    // Add the output IDs to the set of produced output IDs.
+                    output_ids.extend(transaction.output_ids());
+                    // Add the transition public keys to the set of produced transition public keys.
+                    tpks.extend(transaction.transition_public_keys());
+                    // Add any public deployment payer to the set of deployment payers.
+                    if let Transaction::Deploy(_, _, _, fee) = transaction {
+                        fee.payer().map(|payer| deployment_payers.insert(payer));
+                    }
+
+                    // Add the transaction to the list of transactions to verify.
+                    transactions_to_verify.push(transaction);
+                }
+            };
+        }
+
+        // Separate the transactions into deploys and executions.
+        let (deployments, executions): (Vec<&Transaction<N>>, Vec<&Transaction<N>>) =
+            transactions_to_verify.into_iter().partition(|tx| tx.is_deploy());
+        // Chunk the deploys and executions into groups for parallel verification.
+        let deployments_for_verification = deployments.chunks(Self::MAX_PARALLEL_DEPLOY_VERIFICATIONS);
+        let executions_for_verification = executions.chunks(Self::MAX_PARALLEL_EXECUTE_VERIFICATIONS);
+
+        // Verify the transactions in batches and separate the valid and invalid transactions.
+        for transactions in deployments_for_verification.chain(executions_for_verification) {
+            let rngs = (0..transactions.len()).map(|_| StdRng::from_seed(rng.gen())).collect::<Vec<_>>();
+            // Verify the transactions and collect the error message if there is one.
+            let (valid, invalid): (Vec<_>, Vec<_>) =
+                cfg_into_iter!(transactions).zip(rngs).partition_map(|(transaction, mut rng)| {
+                    // Verify the transaction.
+                    match self.check_transaction(transaction, None, &mut rng) {
+                        // If the transaction is valid, add it to the list of valid transactions.
+                        Ok(_) => Either::Left(*transaction),
+                        // If the transaction is invalid, add it to the list of aborted transactions.
+                        Err(e) => Either::Right((*transaction, e.to_string())),
+                    }
+                });
+
+            // Collect the valid and aborted transactions.
+            valid_transactions.extend(valid);
+            aborted_transactions.extend(invalid);
+        }
+
+        // Sort the valid and aborted transactions based on their position in the original list.
+        let position: IndexSet<_> = transactions.iter().map(|tx| tx.id()).collect();
+        cfg_sort_by_cached_key!(valid_transactions, |tx| position.get_index_of(&tx.id()));
+        cfg_sort_by_cached_key!(aborted_transactions, |tx| position.get_index_of(&tx.0.id()));
+
+        // Return the valid and invalid transactions.
+        Ok((valid_transactions, aborted_transactions))
+    }
+
+    /// Performs precondition checks on the transaction prior to execution.
+    ///
+    /// This method is used to check the following conditions:
+    /// - If the transaction contains a `credits.aleo/bond_public` transition,
+    ///   then the outcome should not exceed the maximum committee size.
+    #[inline]
+    fn prepare_for_execution(store: &FinalizeStore<N, C::FinalizeStorage>, execution: &Execution<N>) -> Result<()> {
+        // Construct the program ID.
+        let program_id = ProgramID::from_str("credits.aleo")?;
+        // Construct the committee mapping name.
+        let committee_mapping = Identifier::from_str("committee")?;
+
+        // Check if the execution has any `bond_validator` transitions, and collect
+        // the unique validator addresses if so.
+        // Note: This does not dedup for existing and new validator addresses.
+        let bond_validator_addresses: HashSet<_> = execution
+            .transitions()
+            .filter_map(|transition| match transition.is_bond_validator() {
+                // Get the first argument of the transition output if it is a `Future` with a `Plaintext` argument.
+                true => match transition.outputs().first() {
+                    Some(Output::Future(_, Some(future))) => future.arguments().first().and_then(|arg| match arg {
+                        Argument::Plaintext(Plaintext::Literal(Literal::Address(address), _)) => Some(*address),
+                        _ => None,
+                    }),
+                    _ => None,
+                },
+                false => None,
+            })
+            .collect();
+
+        // Check if we need to reject the execution if the number of new validators exceeds the maximum committee size.
+        match bond_validator_addresses.is_empty() {
+            false => {
+                // Retrieve the committee members from storage.
+                let committee_members = store
+                    .get_mapping_speculative(program_id, committee_mapping)?
+                    .into_iter()
+                    .map(|(key, _)| match key {
+                        // Extract the address from the key.
+                        Plaintext::Literal(Literal::Address(address), _) => Ok(address),
+                        _ => Err(anyhow!("Invalid committee key (missing address) - {key}")),
+                    })
+                    .collect::<Result<HashSet<_>>>()?;
+                // Get the number of new validators being bonded to.
+                let num_new_validators =
+                    bond_validator_addresses.into_iter().filter(|address| !committee_members.contains(address)).count();
+                // Compute the next committee size.
+                let next_committee_size = committee_members.len().saturating_add(num_new_validators);
+                // Check that the number of new validators being bonded does not exceed the maximum number of validators.
+                match next_committee_size > Committee::<N>::MAX_COMMITTEE_SIZE as usize {
+                    true => Err(anyhow!("Call to 'credits.aleo/bond_public' exceeds the committee size")),
+                    false => Ok(()),
+                }
+            }
+            true => Ok(()),
+        }
+    }
+
     /// Performs the pre-ratifications before finalizing transactions.
     #[inline]
     fn atomic_pre_ratify<'a>(
@@ -756,12 +998,16 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
         let program_id = ProgramID::from_str("credits.aleo")?;
         // Construct the committee mapping name.
         let committee_mapping = Identifier::from_str("committee")?;
+        // Construct the delegated mapping name.
+        let delegated_mapping: Identifier<N> = Identifier::from_str("delegated")?;
         // Construct the bonded mapping name.
         let bonded_mapping = Identifier::from_str("bonded")?;
         // Construct the account mapping name.
         let account_mapping = Identifier::from_str("account")?;
         // Construct the metadata mapping name.
         let metadata_mapping = Identifier::from_str("metadata")?;
+        // Construct the withdraw mapping name.
+        let withdraw_mapping = Identifier::from_str("withdraw")?;
 
         // Initialize a list of finalize operations.
         let mut finalize_operations = Vec::new();
@@ -806,19 +1052,28 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
                     // }
 
                     // Calculate the stake per validator using `bonded_balances`.
+                    //
+                    // Note: There is no need to check the `delegated` mapping in the genesis block,
+                    // because the design of `bonded_balances` by definition does not support
+                    // delegating to a non-bonded validator. Thus, the assumption is that the
+                    // `delegated` mapping will be correct by construction.
                     let mut stake_per_validator = IndexMap::with_capacity(committee.members().len());
-                    for (address, (validator_address, amount)) in bonded_balances.iter() {
+                    for (address, (validator_address, _, amount)) in bonded_balances.iter() {
                         // Check that the amount meets the minimum requirement, depending on whether the address is a validator.
                         if *address == *validator_address {
                             ensure!(
-                                *amount >= MIN_VALIDATOR_STAKE,
-                                "Ratify::Genesis(..) the validator {address} must stake at least {MIN_VALIDATOR_STAKE}",
+                                *amount >= MIN_VALIDATOR_SELF_STAKE,
+                                "Ratify::Genesis(..) the validator {address} must stake at least {MIN_VALIDATOR_SELF_STAKE}",
                             );
                         } else {
                             ensure!(
                                 *amount >= MIN_DELEGATOR_STAKE,
                                 "Ratify::Genesis(..) the delegator {address} must stake at least {MIN_DELEGATOR_STAKE}",
                             );
+                            // If the corresponding validator is not a committee member yet, then continue.
+                            if !committee.is_committee_member(*validator_address) {
+                                continue;
+                            }
                             // If the address is a delegator, check that the corresponding validator is open.
                             ensure!(
                                 committee.is_committee_member_open(*validator_address),
@@ -838,7 +1093,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
                     // Check that `committee` is consistent with `stake_per_validator`.
                     for (validator_address, amount) in &stake_per_validator {
                         // Retrieve the expected validator stake from the committee.
-                        let Some((expected_amount, _)) = committee.members().get(*validator_address) else {
+                        let Some((expected_amount, _, _)) = committee.members().get(*validator_address) else {
                             bail!(
                                 "Ratify::Genesis(..) found a validator in the bonded balances that is not in the committee"
                             )
@@ -855,9 +1110,27 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
                         "Ratify::Genesis(..) incorrect total total stake for the committee"
                     );
 
+                    // Split the bonded balances into stakers and withdrawal addresses.
+                    let (next_stakers, withdrawal_addresses) = bonded_balances.iter().fold(
+                        (
+                            IndexMap::with_capacity(bonded_balances.len()),
+                            IndexMap::with_capacity(bonded_balances.len()),
+                        ),
+                        |(mut stakers, mut withdrawal_addresses), (staker, (validator, withdrawal_address, amount))| {
+                            stakers.insert(*staker, (*validator, *amount));
+                            withdrawal_addresses.insert(*staker, *withdrawal_address);
+                            (stakers, withdrawal_addresses)
+                        },
+                    );
+
+                    let next_delegated = to_next_delegated(&next_stakers);
+
                     // Construct the next committee map and next bonded map.
-                    let (next_committee_map, next_bonded_map) =
-                        to_next_commitee_map_and_bonded_map(committee, bonded_balances);
+                    let (next_committee_map, next_bonded_map, next_delegated_map) =
+                        to_next_committee_bonded_delegated_map(committee, &next_stakers, &next_delegated);
+
+                    // Construct the next withdraw map.
+                    let next_withdraw_map = to_next_withdraw_map(&withdrawal_addresses);
 
                     // Insert the next committee into storage.
                     store.committee_store().insert(state.block_height(), *(committee.clone()))?;
@@ -865,8 +1138,12 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
                     finalize_operations.extend(&[
                         // Replace the committee mapping in storage.
                         store.replace_mapping(program_id, committee_mapping, next_committee_map)?,
+                        // Replace the delegated mapping in storage.
+                        store.replace_mapping(program_id, delegated_mapping, next_delegated_map)?,
                         // Replace the bonded mapping in storage.
                         store.replace_mapping(program_id, bonded_mapping, next_bonded_map)?,
+                        // Replace the withdraw mapping in storage.
+                        store.replace_mapping(program_id, withdraw_mapping, next_withdraw_map)?,
                     ]);
 
                     // Update the number of validators.
@@ -921,7 +1198,8 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
 
     /// Performs the post-ratifications after finalizing transactions.
     #[inline]
-    fn atomic_post_ratify<'a>(
+    fn atomic_post_ratify<'a, const IS_FINALIZE: bool>(
+        puzzle: &Puzzle<N>,
         store: &FinalizeStore<N, C::FinalizeStorage>,
         state: FinalizeGlobalState,
         post_ratifications: impl Iterator<Item = &'a Ratify<N>>,
@@ -931,6 +1209,8 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
         let program_id = ProgramID::from_str("credits.aleo")?;
         // Construct the committee mapping name.
         let committee_mapping = Identifier::from_str("committee")?;
+        // Construct the delegated mapping name.
+        let delegated_mapping = Identifier::from_str("delegated")?;
         // Construct the bonded mapping name.
         let bonded_mapping = Identifier::from_str("bonded")?;
         // Construct the account mapping name.
@@ -954,8 +1234,14 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
 
                     // Retrieve the committee mapping from storage.
                     let current_committee_map = store.get_mapping_speculative(program_id, committee_mapping)?;
+                    // Retrieve the delegator mapping from storage.
+                    let current_delegator_map = store.get_mapping_speculative(program_id, delegated_mapping)?;
                     // Convert the committee mapping into a committee.
-                    let current_committee = committee_map_into_committee(state.block_round(), current_committee_map)?;
+                    let current_committee = committee_and_delegated_maps_into_committee(
+                        state.block_round(),
+                        current_committee_map,
+                        current_delegator_map,
+                    )?;
                     // Retrieve the bonded mapping from storage.
                     let current_bonded_map = store.get_mapping_speculative(program_id, bonded_mapping)?;
                     // Convert the bonded map into stakers.
@@ -966,19 +1252,56 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
 
                     // Compute the updated stakers, using the committee and block reward.
                     let next_stakers = staking_rewards(&current_stakers, &current_committee, *block_reward);
-                    // Compute the updated committee, using the stakers.
-                    let next_committee = to_next_committee(&current_committee, state.block_round(), &next_stakers)?;
 
-                    // Construct the next committee map and next bonded map.
-                    let (next_committee_map, next_bonded_map) =
-                        to_next_commitee_map_and_bonded_map(&next_committee, &next_stakers);
+                    // Compute the updated delegated amounts, using the next_stakers updated amounts.
+                    let next_delegated = to_next_delegated(&next_stakers);
+
+                    // Compute the updated committee, using the delegatees.
+                    let next_committee = to_next_committee(&current_committee, state.block_round(), &next_delegated)?;
+
+                    // Construct the next committee map, the next bonded map, and the next delegated map.
+                    let (next_committee_map, next_bonded_map, next_delegated_map) =
+                        to_next_committee_bonded_delegated_map(&next_committee, &next_stakers, &next_delegated);
 
                     // Insert the next committee into storage.
                     store.committee_store().insert(state.block_height(), next_committee)?;
+
+                    #[cfg(all(feature = "history", feature = "rocks"))]
+                    {
+                        // When finalizing in `FinalizeMode::RealRun`, store the delegated and bonded mappings in history.
+                        if IS_FINALIZE {
+                            // Load a `History` object.
+                            let history = History::new(N::ID, store.storage_mode());
+
+                            // Write the delegated mapping as JSON.
+                            history.store_mapping(state.block_height(), MappingName::Delegated, &next_delegated_map)?;
+
+                            // Write the bonded mapping as JSON.
+                            history.store_mapping(state.block_height(), MappingName::Bonded, &next_bonded_map)?;
+
+                            // Write the metadata mapping as JSON.
+                            let metadata_mapping = Identifier::from_str("metadata")?;
+                            let metadata_map = store.get_mapping_speculative(program_id, metadata_mapping)?;
+                            history.store_mapping(state.block_height(), MappingName::Metadata, &metadata_map)?;
+
+                            // Write the unbonding mapping as JSON.
+                            let unbonding_mapping = Identifier::from_str("unbonding")?;
+                            let unbonding_map = store.get_mapping_speculative(program_id, unbonding_mapping)?;
+                            history.store_mapping(state.block_height(), MappingName::Unbonding, &unbonding_map)?;
+
+                            // Write the withdraw mapping as JSON.
+                            let withdraw_mapping = Identifier::from_str("withdraw")?;
+                            let withdraw_map = store.get_mapping_speculative(program_id, withdraw_mapping)?;
+                            history.store_mapping(state.block_height(), MappingName::Withdraw, &withdraw_map)?;
+                        }
+                    }
+
                     // Store the finalize operations for updating the committee and bonded mapping.
                     finalize_operations.extend(&[
                         // Replace the committee mapping in storage.
                         store.replace_mapping(program_id, committee_mapping, next_committee_map)?,
+                        // Replace the delegated mapping in storage.
+                        store.replace_mapping(program_id, delegated_mapping, next_delegated_map)?,
                         // Replace the bonded mapping in storage.
                         store.replace_mapping(program_id, bonded_mapping, next_bonded_map)?,
                     ]);
@@ -999,8 +1322,10 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
                         continue;
                     };
                     // Compute the proof targets, with the corresponding addresses.
-                    let proof_targets =
-                        solutions.values().map(|s| Ok((s.address(), s.to_target()?))).collect::<Result<Vec<_>>>()?;
+                    let proof_targets = solutions
+                        .values()
+                        .map(|s| Ok((s.address(), puzzle.get_proof_target(s)?)))
+                        .collect::<Result<Vec<_>>>()?;
                     // Calculate the proving rewards.
                     let proving_rewards = proving_rewards(proof_targets, *puzzle_reward);
                     // Iterate over the proving rewards.
@@ -1036,7 +1361,10 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::{test_helpers, test_helpers::sample_finalize_state};
+    use crate::vm::{
+        test_helpers,
+        test_helpers::{sample_finalize_state, sample_vm},
+    };
     use console::{
         account::{Address, PrivateKey, ViewKey},
         program::{Ciphertext, Entry, Record},
@@ -1135,6 +1463,7 @@ finalize transfer_public:
             vec![],
             &None.into(),
             transactions.iter(),
+            rng,
         )?;
 
         // Construct the metadata associated with the block.
@@ -1306,39 +1635,43 @@ finalize transfer_public:
     }
 
     /// Samples the validators.
-    fn sample_validators<N: Network>(num_validators: usize, rng: &mut TestRng) -> IndexMap<PrivateKey<N>, (u64, bool)> {
+    fn sample_validators<N: Network>(
+        num_validators: usize,
+        rng: &mut TestRng,
+    ) -> IndexMap<PrivateKey<N>, (u64, bool, u8)> {
         (0..num_validators)
             .map(|_| {
                 let private_key = PrivateKey::new(rng).unwrap();
                 let amount = MIN_VALIDATOR_STAKE;
                 let is_open = true;
-                (private_key, (amount, is_open))
+                let commission: u8 = 0;
+                (private_key, (amount, is_open, commission))
             })
             .collect::<IndexMap<_, _>>()
     }
 
     /// Returns a `committee_map` and the `allocated_amount` given the validators and delegators.
     fn sample_committee_map_and_allocated_amount<N: Network>(
-        validators: &IndexMap<PrivateKey<N>, (u64, bool)>,
+        validators: &IndexMap<PrivateKey<N>, (u64, bool, u8)>,
         delegators: &IndexMap<PrivateKey<N>, (Address<N>, u64)>,
-    ) -> (IndexMap<Address<N>, (u64, bool)>, u64) {
+    ) -> (IndexMap<Address<N>, (u64, bool, u8)>, u64) {
         // Reset the tracked amount.
         let mut allocated_amount = 0;
 
         // Construct the **correct** committee.
         let mut committee_map = IndexMap::new();
-        for (private_key, (amount, is_open)) in validators {
+        for (private_key, (amount, is_open, commission)) in validators {
             let address = Address::try_from(private_key).unwrap();
-            committee_map.insert(address, (*amount, *is_open));
+            committee_map.insert(address, (*amount, *is_open, *commission));
             allocated_amount += amount;
         }
         for (delegator, (validator, amount)) in delegators {
             if let indexmap::map::Entry::Occupied(mut entry) = committee_map.entry(*validator) {
-                let (current_amount, is_open) = entry.get();
+                let (current_amount, is_open, commission) = entry.get();
                 // Ensure the validator is open.
                 assert!(*is_open, "delegator {delegator} is delegating {amount} microcredits to a closed validator");
                 // Update the committee map.
-                entry.insert((current_amount + amount, *is_open));
+                entry.insert((current_amount + amount, *is_open, *commission));
             } else {
                 unreachable!("delegator {delegator} is delegating to a closed validator")
             }
@@ -1350,18 +1683,19 @@ finalize transfer_public:
     }
 
     /// Returns the `bonded_balances` given the validators and delegators.
+    /// Note that the withdrawal address is the same as the staker address.
     fn sample_bonded_balances<N: Network>(
-        validators: &IndexMap<PrivateKey<N>, (u64, bool)>,
+        validators: &IndexMap<PrivateKey<N>, (u64, bool, u8)>,
         delegators: &IndexMap<PrivateKey<N>, (Address<N>, u64)>,
-    ) -> IndexMap<Address<N>, (Address<N>, u64)> {
+    ) -> IndexMap<Address<N>, (Address<N>, Address<N>, u64)> {
         let mut bonded_balances = IndexMap::with_capacity(validators.len() + delegators.len());
-        for (private_key, (amount, _)) in validators {
+        for (private_key, (amount, _, _)) in validators {
             let address = Address::try_from(private_key).unwrap();
-            bonded_balances.insert(address, (address, *amount));
+            bonded_balances.insert(address, (address, address, *amount));
         }
         for (private_key, (validator, amount)) in delegators {
             let address = Address::try_from(private_key).unwrap();
-            bonded_balances.insert(address, (*validator, *amount));
+            bonded_balances.insert(address, (*validator, address, *amount));
         }
         bonded_balances
     }
@@ -1399,7 +1733,14 @@ finalize transfer_public:
 
         // Prepare the confirmed transactions.
         let (ratifications, confirmed_transactions, aborted_transaction_ids, _) = vm
-            .speculate(sample_finalize_state(1), None, vec![], &None.into(), [deployment_transaction.clone()].iter())
+            .speculate(
+                sample_finalize_state(1),
+                None,
+                vec![],
+                &None.into(),
+                [deployment_transaction.clone()].iter(),
+                rng,
+            )
             .unwrap();
         assert_eq!(confirmed_transactions.len(), 1);
         assert!(aborted_transaction_ids.is_empty());
@@ -1429,6 +1770,93 @@ finalize transfer_public:
 
         // Check that the unconfirmed transaction ID of the rejected deployment is correct.
         assert_eq!(candidate_transactions[0].to_unconfirmed_transaction_id().unwrap(), deployment_transaction_id);
+    }
+
+    #[test]
+    fn test_bond_validator_above_maximum_fails() {
+        // Initialize an RNG.
+        let rng = &mut TestRng::default();
+
+        // Initialize the VM.
+        let vm = sample_vm();
+
+        // Initialize the validators with the maximum number of validators.
+        let validators =
+            sample_validators::<CurrentNetwork>(Committee::<CurrentNetwork>::MAX_COMMITTEE_SIZE as usize, rng);
+
+        // Initialize a new address.
+        let new_validator_private_key = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
+        let new_validator_address = Address::try_from(&new_validator_private_key).unwrap();
+
+        // Construct the committee.
+        // Track the allocated amount.
+        let (committee_map, allocated_amount) =
+            sample_committee_map_and_allocated_amount(&validators, &IndexMap::new());
+
+        // Collect all of the addresses in a single place
+        let validator_addresses =
+            validators.keys().map(|private_key| Address::try_from(private_key).unwrap()).collect::<Vec<_>>();
+
+        // Construct the public balances, allocating the remaining supply.
+        let new_validator_balance = MIN_VALIDATOR_STAKE + 100_000_000;
+        let mut public_balances = sample_public_balances(
+            &validator_addresses,
+            <CurrentNetwork as Network>::STARTING_SUPPLY - allocated_amount - new_validator_balance,
+        );
+        // Set the public balance of the new validator to the minimum validator stake.
+        public_balances.insert(new_validator_address, new_validator_balance);
+
+        // Construct the bonded balances.
+        let bonded_balances = sample_bonded_balances(&validators, &IndexMap::new());
+
+        // Construct the genesis block, which should pass.
+        let block = vm
+            .genesis_quorum(
+                validators.keys().next().unwrap(),
+                Committee::new_genesis(committee_map).unwrap(),
+                public_balances,
+                bonded_balances,
+                rng,
+            )
+            .unwrap();
+
+        // Add the block.
+        vm.add_next_block(&block).unwrap();
+
+        // Attempt to bond a new validator above the maximum number of validators.
+        let inputs = vec![
+            Value::<CurrentNetwork>::from_str(&validator_addresses.first().unwrap().to_string()).unwrap(), // Withdrawal address
+            Value::<CurrentNetwork>::from_str(&format!("{MIN_VALIDATOR_STAKE}u64")).unwrap(),              // Amount
+            Value::<CurrentNetwork>::from_str("42u8").unwrap(),                                            // Commission
+        ];
+
+        // Execute.
+        let bond_validator_transaction = vm
+            .execute(
+                &new_validator_private_key,
+                ("credits.aleo", "bond_validator"),
+                inputs.into_iter(),
+                None,
+                1,
+                None,
+                rng,
+            )
+            .unwrap();
+
+        // Verify.
+        vm.check_transaction(&bond_validator_transaction, None, rng).unwrap();
+
+        // Speculate on the transactions.
+        let transactions = [bond_validator_transaction.clone()];
+        let (_, confirmed_transactions, _, _) =
+            vm.atomic_speculate(sample_finalize_state(1), None, vec![], &None.into(), transactions.iter()).unwrap();
+
+        // Assert that the transaction is rejected.
+        assert_eq!(confirmed_transactions.len(), 1);
+        assert_eq!(
+            confirmed_transactions[0],
+            reject(0, &bond_validator_transaction, confirmed_transactions[0].finalize_operations())
+        );
     }
 
     #[test]
@@ -1687,7 +2115,7 @@ function ped_hash:
 
             // Speculatively execute the transaction. Ensure that this call does not panic and returns a rejected transaction.
             let (_, confirmed_transactions, aborted_transaction_ids, _) = vm
-                .speculate(sample_finalize_state(1), None, vec![], &None.into(), [transaction.clone()].iter())
+                .speculate(sample_finalize_state(1), None, vec![], &None.into(), [transaction.clone()].iter(), rng)
                 .unwrap();
             assert!(aborted_transaction_ids.is_empty());
 
@@ -1914,8 +2342,7 @@ finalize compute:
         let rng = &mut TestRng::default();
 
         // Initialize the VM.
-        let vm =
-            VM::from(ConsensusStore::<CurrentNetwork, ConsensusMemory<CurrentNetwork>>::open(None).unwrap()).unwrap();
+        let vm = sample_vm();
 
         // Construct the validators, greater than the maximum committee size.
         let validators =
@@ -1923,9 +2350,9 @@ finalize compute:
 
         // Construct the committee.
         let mut committee_map = IndexMap::new();
-        for (private_key, (amount, _)) in &validators {
+        for (private_key, (amount, _, _)) in &validators {
             let address = Address::try_from(private_key).unwrap();
-            committee_map.insert(address, (*amount, true));
+            committee_map.insert(address, (*amount, true, 0));
         }
 
         // Attempt to construct a `Committee` with more than the maximum committee size.
@@ -1933,6 +2360,7 @@ finalize compute:
         assert!(result.is_err());
 
         // Reset the validators.
+        // Note: We use a smaller committee size to ensure that there is enough supply to allocate to the validators and genesis block transactions.
         let validators =
             sample_validators::<CurrentNetwork>(Committee::<CurrentNetwork>::MAX_COMMITTEE_SIZE as usize, rng);
 
@@ -1972,12 +2400,12 @@ finalize compute:
         let rng = &mut TestRng::default();
 
         // Initialize the VM.
-        let vm =
-            VM::from(ConsensusStore::<CurrentNetwork, ConsensusMemory<CurrentNetwork>>::open(None).unwrap()).unwrap();
+        let vm = sample_vm();
 
         // Construct the validators.
+        // Note: We use a smaller committee size to ensure that there is enough supply to allocate to the validators and genesis block transactions.
         let validators =
-            sample_validators::<CurrentNetwork>(Committee::<CurrentNetwork>::MAX_COMMITTEE_SIZE as usize, rng);
+            sample_validators::<CurrentNetwork>(Committee::<CurrentNetwork>::MAX_COMMITTEE_SIZE as usize / 4, rng);
 
         // Construct the delegators, greater than the maximum delegator size.
         let delegators = (0..MAX_DELEGATORS + 1)
@@ -2028,8 +2456,7 @@ finalize compute:
         println!("Initializing VMs.");
 
         // Initialize the VM.
-        let vm =
-            VM::from(ConsensusStore::<CurrentNetwork, ConsensusMemory<CurrentNetwork>>::open(None).unwrap()).unwrap();
+        let vm = sample_vm();
 
         println!("Constructing validator and delegator sets.");
 
@@ -2097,16 +2524,17 @@ finalize compute:
         let bonded_mapping_name = Identifier::from_str("bonded").unwrap();
         let metadata_mapping_name = Identifier::from_str("metadata").unwrap();
         let unbonding_mapping_name = Identifier::from_str("unbonding").unwrap();
+        let withdraw_mapping_name = Identifier::from_str("withdraw").unwrap();
 
         // Get and check the committee mapping.
         let actual_committee = vm.finalize_store().get_mapping_confirmed(program_id, committee_mapping_name).unwrap();
         let expected_committee = committee
             .members()
             .iter()
-            .map(|(address, (amount, is_open))| {
+            .map(|(address, (_, is_open, commission))| {
                 (
                     Plaintext::from_str(&address.to_string()).unwrap(),
-                    Value::from_str(&format!("{{ microcredits: {amount}u64, is_open: {is_open} }}")).unwrap(),
+                    Value::from_str(&format!("{{ is_open: {is_open}, commission: {commission}u8 }}")).unwrap(),
                 )
             })
             .collect_vec();
@@ -2136,7 +2564,7 @@ finalize compute:
             // Note that the first validator is used to execute additional transactions in `VM::genesis_quorum`.
             // Therefore, the balance of the first validator will be different from the expected balance.
             if entry.0 == Plaintext::from_str(&first_validator.to_string()).unwrap() {
-                assert_eq!(entry.1, Value::from_str("294999983894244u64").unwrap());
+                assert_eq!(entry.1, Value::from_str("144991999894244u64").unwrap());
             } else {
                 assert!(expected_account.contains(entry));
             }
@@ -2146,7 +2574,7 @@ finalize compute:
         let actual_bonded = vm.finalize_store().get_mapping_confirmed(program_id, bonded_mapping_name).unwrap();
         let expected_bonded = bonded_balances
             .iter()
-            .map(|(address, (validator, amount))| {
+            .map(|(address, (validator, _, amount))| {
                 (
                     Plaintext::from_str(&address.to_string()).unwrap(),
                     Value::from_str(&format!("{{ validator: {validator}, microcredits: {amount}u64 }}")).unwrap(),
@@ -2159,6 +2587,25 @@ finalize compute:
         assert_eq!(actual_bonded.len(), expected_bonded.len());
         for entry in actual_bonded.iter() {
             assert!(expected_bonded.contains(entry));
+        }
+
+        // Get and check the withdraw mapping.
+        let actual_withdraw = vm.finalize_store().get_mapping_confirmed(program_id, withdraw_mapping_name).unwrap();
+        let expected_withdraw = bonded_balances
+            .iter()
+            .map(|(address, (_, withdrawal_address, _))| {
+                (
+                    Plaintext::from_str(&address.to_string()).unwrap(),
+                    Value::from_str(&withdrawal_address.to_string()).unwrap(),
+                )
+            })
+            .collect_vec();
+        // Note that `actual_withdraw` and `expected_withdraw` are vectors and not necessarily in the same order.
+        // By checking that the lengths of the vector are equal and that all entries in `actual_withdraw` are in `expected_withdraw`,
+        // we can ensure that the two vectors contain the same data.
+        assert_eq!(actual_withdraw.len(), expected_withdraw.len());
+        for entry in actual_withdraw.iter() {
+            assert!(expected_withdraw.contains(entry));
         }
 
         // Get and check the entry in metadata mapping corresponding to the number of validators.
@@ -2201,10 +2648,8 @@ finalize compute:
         println!("Initializing VMs.");
 
         // Initialize two VMs.
-        let vm_1 =
-            VM::from(ConsensusStore::<CurrentNetwork, ConsensusMemory<CurrentNetwork>>::open(None).unwrap()).unwrap();
-        let vm_2 =
-            VM::from(ConsensusStore::<CurrentNetwork, ConsensusMemory<CurrentNetwork>>::open(None).unwrap()).unwrap();
+        let vm_1 = sample_vm();
+        let vm_2 = sample_vm();
 
         println!("Constructing validator and delegator sets.");
 
@@ -2274,6 +2719,8 @@ finalize compute:
                     ("credits.aleo", "bond_public"),
                     vec![
                         Value::<CurrentNetwork>::from_str(&validator.to_string()).unwrap(),
+                        Value::<CurrentNetwork>::from_str(&Address::try_from(private_key).unwrap().to_string())
+                            .unwrap(),
                         Value::<CurrentNetwork>::from_str(&format!("{amount}u64")).unwrap(),
                     ]
                     .into_iter(),
@@ -2342,6 +2789,7 @@ finalize compute:
         let unbonding_mapping_name = Identifier::from_str("unbonding").unwrap();
         let account_mapping_name = Identifier::from_str("account").unwrap();
         let metadata_mapping_name = Identifier::from_str("metadata").unwrap();
+        let withdraw_mapping_name = Identifier::from_str("withdraw").unwrap();
 
         let committee_1 = vm_1.finalize_store().get_mapping_confirmed(program_id, committee_mapping_name).unwrap();
         let committee_2 = vm_2.finalize_store().get_mapping_confirmed(program_id, committee_mapping_name).unwrap();
@@ -2376,6 +2824,11 @@ finalize compute:
         let metadata_1 = vm_1.finalize_store().get_mapping_confirmed(program_id, metadata_mapping_name).unwrap();
         let metadata_2 = vm_2.finalize_store().get_mapping_confirmed(program_id, metadata_mapping_name).unwrap();
         assert_eq!(metadata_1, metadata_2);
+
+        // Check that the withdraw mapping across both VMs are equal.
+        let withdraw_1 = vm_1.finalize_store().get_mapping_confirmed(program_id, withdraw_mapping_name).unwrap();
+        let withdraw_2 = vm_2.finalize_store().get_mapping_confirmed(program_id, withdraw_mapping_name).unwrap();
+        assert_eq!(withdraw_1, withdraw_2);
     }
 
     #[test]
@@ -2384,8 +2837,7 @@ finalize compute:
         let rng = &mut TestRng::default();
 
         // Initialize the VM.
-        let vm =
-            VM::from(ConsensusStore::<CurrentNetwork, ConsensusMemory<CurrentNetwork>>::open(None).unwrap()).unwrap();
+        let vm = sample_vm();
 
         // Attempt to construct a genesis quorum, with a validator with an insufficient amount.
         let mut validators = (0..3)
@@ -2394,10 +2846,12 @@ finalize compute:
                 let address = Address::try_from(&private_key).unwrap();
                 let amount = MIN_VALIDATOR_STAKE;
                 let is_open = true;
-                (address, (amount, is_open))
+                let commission = 0u8;
+                (address, (amount, is_open, commission))
             })
             .collect::<IndexMap<_, _>>();
-        validators.insert(Address::try_from(PrivateKey::new(rng).unwrap()).unwrap(), (MIN_VALIDATOR_STAKE - 1, true));
+        validators
+            .insert(Address::try_from(PrivateKey::new(rng).unwrap()).unwrap(), (MIN_VALIDATOR_STAKE - 1, true, 0));
 
         // Construct the committee.
         let result = Committee::new_genesis(validators);
@@ -2413,10 +2867,10 @@ finalize compute:
         let committee = Committee::new_genesis(
             validators
                 .iter()
-                .map(|(private_key, (amount, _))| {
+                .map(|(private_key, (amount, _, _))| {
                     let address = Address::try_from(private_key).unwrap();
                     allocated_amount += *amount;
-                    (address, (*amount, true))
+                    (address, (*amount, true, 0u8))
                 })
                 .collect(),
         )
@@ -2446,8 +2900,7 @@ finalize compute:
         let rng = &mut TestRng::default();
 
         // Initialize the VM.
-        let vm =
-            VM::from(ConsensusStore::<CurrentNetwork, ConsensusMemory<CurrentNetwork>>::open(None).unwrap()).unwrap();
+        let vm = sample_vm();
 
         // Track the allocated amount.
         let mut allocated_amount = 0;
@@ -2464,14 +2917,14 @@ finalize compute:
 
         // Construct the committee.
         let mut committee_map = IndexMap::new();
-        for (private_key, (amount, _)) in &validators {
+        for (private_key, (amount, _, _)) in &validators {
             let address = Address::try_from(private_key).unwrap();
             let amount = if address == Address::try_from(validators.keys().next().unwrap()).unwrap() {
                 *amount + MIN_DELEGATOR_STAKE - 1
             } else {
                 *amount
             };
-            committee_map.insert(address, (amount, true));
+            committee_map.insert(address, (amount, true, 0u8));
             allocated_amount += amount;
         }
         let committee = Committee::new_genesis(committee_map).unwrap();
@@ -2504,14 +2957,14 @@ finalize compute:
 
         // Construct the committee.
         let mut committee_map = IndexMap::new();
-        for (private_key, (amount, _)) in &validators {
+        for (private_key, (amount, _, _)) in &validators {
             let address = Address::try_from(private_key).unwrap();
             let amount = if address == Address::try_from(validators.keys().next().unwrap()).unwrap() {
                 *amount + MIN_DELEGATOR_STAKE
             } else {
                 *amount
             };
-            committee_map.insert(address, (amount, true));
+            committee_map.insert(address, (amount, true, 0u8));
             allocated_amount += amount;
         }
         let committee = Committee::new_genesis(committee_map).unwrap();
@@ -2542,8 +2995,7 @@ finalize compute:
         let rng = &mut TestRng::default();
 
         // Initialize the VM.
-        let vm =
-            VM::from(ConsensusStore::<CurrentNetwork, ConsensusMemory<CurrentNetwork>>::open(None).unwrap()).unwrap();
+        let vm = sample_vm();
 
         // Initialize the validators.
         let validators = sample_validators(4, rng);
@@ -2618,8 +3070,7 @@ finalize compute:
         let rng = &mut TestRng::default();
 
         // Initialize the VM.
-        let vm =
-            VM::from(ConsensusStore::<CurrentNetwork, ConsensusMemory<CurrentNetwork>>::open(None).unwrap()).unwrap();
+        let vm = sample_vm();
 
         // Initialize the validators, with one closed.
         let validators = (0..4)
@@ -2627,7 +3078,8 @@ finalize compute:
                 let private_key = PrivateKey::new(rng).unwrap();
                 let amount = MIN_VALIDATOR_STAKE;
                 let is_open = i != 0;
-                (private_key, (amount, is_open))
+                let commission = 0;
+                (private_key, (amount, is_open, commission))
             })
             .collect::<IndexMap<_, _>>();
 
@@ -2673,6 +3125,7 @@ finalize compute:
                         &Address::try_from(validators.keys().next().unwrap()).unwrap().to_string(),
                     )
                     .unwrap(),
+                    Value::<CurrentNetwork>::from_str(&Address::try_from(delegator_key).unwrap().to_string()).unwrap(),
                     Value::<CurrentNetwork>::from_str(&format!("{MIN_DELEGATOR_STAKE}u64")).unwrap(),
                 ]
                 .into_iter(),
@@ -2711,6 +3164,7 @@ finalize compute:
                         &Address::try_from(validators.keys().nth(1).unwrap()).unwrap().to_string(),
                     )
                     .unwrap(),
+                    Value::<CurrentNetwork>::from_str(&Address::try_from(delegator_key).unwrap().to_string()).unwrap(),
                     Value::<CurrentNetwork>::from_str(&format!("{MIN_DELEGATOR_STAKE}u64")).unwrap(),
                 ]
                 .into_iter(),
@@ -2744,5 +3198,90 @@ finalize compute:
             )
             .unwrap();
         assert_eq!(bonded_mapping.len(), validators.len() + 1);
+    }
+
+    #[test]
+    fn test_ratify_genesis_withdrawal_address() {
+        const NUM_VALIDATORS: usize = 5;
+        const NUM_DELEGATORS: usize = 8;
+
+        // Sample an RNG.
+        let rng = &mut TestRng::default();
+
+        // Initialize the VM.
+        let vm = sample_vm();
+
+        // Sample the validators.
+        let validators = sample_validators(NUM_VALIDATORS, rng);
+
+        // Sample the delegators, cycling through the validators.
+        let delegators: IndexMap<_, _> = (0..NUM_DELEGATORS)
+            .map(|i| {
+                let private_key = PrivateKey::new(rng).unwrap();
+                let validator = Address::try_from(validators.keys().nth(i % NUM_VALIDATORS).unwrap()).unwrap();
+                let amount = MIN_DELEGATOR_STAKE;
+                (private_key, (validator, amount))
+            })
+            .collect();
+
+        // Construct the committee.
+        // Track the allocated amount.
+        let (committee_map, allocated_amount) = sample_committee_map_and_allocated_amount(&validators, &delegators);
+        let committee = Committee::new_genesis(committee_map).unwrap();
+
+        // Construct the public balances, allocating the remaining supply to the validators and zero to the delegators.
+        let mut public_balances = sample_public_balances(
+            &validators.keys().map(|private_key| Address::try_from(private_key).unwrap()).collect::<Vec<_>>(),
+            <CurrentNetwork as Network>::STARTING_SUPPLY - allocated_amount,
+        );
+        public_balances.extend(sample_public_balances(
+            &delegators.keys().map(|private_key| Address::try_from(private_key).unwrap()).collect::<Vec<_>>(),
+            0,
+        ));
+
+        // Construct the bonded balances.
+        let mut bonded_balances = sample_bonded_balances(&validators, &delegators);
+
+        // Randomly sample and update the withdrawal addresses in the bonded balances.
+        for (_, (_, withdrawal_address, _)) in bonded_balances.iter_mut() {
+            *withdrawal_address = Address::rand(rng);
+        }
+
+        // Construct the genesis block.
+        let genesis = vm
+            .genesis_quorum(
+                validators.keys().next().unwrap(),
+                committee.clone(),
+                public_balances.clone(),
+                bonded_balances.clone(),
+                rng,
+            )
+            .unwrap();
+
+        // Add the genesis block to the VM.
+        vm.add_next_block(&genesis).unwrap();
+
+        // Check that the state of the `credits.aleo` program is correct.
+        let program_id = ProgramID::from_str("credits.aleo").unwrap();
+        let withdraw_mapping_name = Identifier::from_str("withdraw").unwrap();
+
+        // Get and check the withdraw mapping.
+        let actual_withdraw = vm.finalize_store().get_mapping_confirmed(program_id, withdraw_mapping_name).unwrap();
+        let expected_withdraw = bonded_balances
+            .iter()
+            .map(|(address, (_, withdrawal_address, _))| {
+                (
+                    Plaintext::from_str(&address.to_string()).unwrap(),
+                    Value::from_str(&withdrawal_address.to_string()).unwrap(),
+                )
+            })
+            .collect_vec();
+        // Note that `actual_withdraw` and `expected_withdraw` are vectors and not necessarily in the same order.
+        // By checking that the lengths of the vector are equal and that all entries in `actual_withdraw` are in `expected_withdraw`,
+        // we can ensure that the two vectors contain the same data.
+        assert_eq!(actual_withdraw.len(), expected_withdraw.len());
+        for entry in actual_withdraw.iter() {
+            assert!(expected_withdraw.contains(entry));
+        }
     }
 }

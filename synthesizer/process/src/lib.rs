@@ -158,7 +158,12 @@ impl<N: Network> Process<N> {
         for function_name in program.functions().keys() {
             // Load the verifying key.
             let verifying_key = N::get_credits_verifying_key(function_name.to_string())?;
-            stack.insert_verifying_key(function_name, VerifyingKey::new(verifying_key.clone()))?;
+            // Retrieve the number of public and private variables.
+            // Note: This number does *NOT* include the number of constants. This is safe because
+            // this program is never deployed, as it is a first-class citizen of the protocol.
+            let num_variables = verifying_key.circuit_info.num_public_and_private_variables as u64;
+            // Insert the verifying key.
+            stack.insert_verifying_key(function_name, VerifyingKey::new(verifying_key.clone(), num_variables))?;
             lap!(timer, "Load verifying key for {function_name}");
         }
         lap!(timer, "Load circuit keys");
@@ -296,6 +301,44 @@ pub mod test_helpers {
 
     type CurrentNetwork = MainnetV0;
     type CurrentAleo = circuit::network::AleoV0;
+
+    /// Returns an execution for the given program and function name.
+    pub fn get_execution(
+        process: &mut Process<CurrentNetwork>,
+        program: &Program<CurrentNetwork>,
+        function_name: &Identifier<CurrentNetwork>,
+        inputs: impl ExactSizeIterator<Item = impl TryInto<Value<CurrentNetwork>>>,
+    ) -> Execution<CurrentNetwork> {
+        // Initialize a new rng.
+        let rng = &mut TestRng::default();
+
+        // Initialize a private key.
+        let private_key = PrivateKey::new(rng).unwrap();
+
+        // Add the program to the process if doesn't yet exist.
+        if !process.contains_program(program.id()) {
+            process.add_program(program).unwrap();
+        }
+
+        // Compute the authorization.
+        let authorization =
+            process.authorize::<CurrentAleo, _>(&private_key, program.id(), function_name, inputs, rng).unwrap();
+
+        // Execute the program.
+        let (_, mut trace) = process.execute::<CurrentAleo, _>(authorization, rng).unwrap();
+
+        // Initialize a new block store.
+        let block_store = BlockStore::<CurrentNetwork, BlockMemory<_>>::open(None).unwrap();
+
+        // Prepare the assignments from the block store.
+        trace.prepare(ledger_query::Query::from(block_store)).unwrap();
+
+        // Get the locator.
+        let locator = format!("{:?}:{function_name:?}", program.id());
+
+        // Return the execution object.
+        trace.prove_execution::<CurrentAleo, _>(&locator, rng).unwrap()
+    }
 
     pub fn sample_key() -> (Identifier<CurrentNetwork>, ProvingKey<CurrentNetwork>, VerifyingKey<CurrentNetwork>) {
         static INSTANCE: OnceCell<(

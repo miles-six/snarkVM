@@ -16,7 +16,7 @@
 #![allow(clippy::type_complexity)]
 
 use super::*;
-use ledger_coinbase::{CoinbasePuzzle, EpochChallenge};
+use ledger_puzzle::Puzzle;
 use synthesizer_program::FinalizeOperation;
 
 use std::collections::HashSet;
@@ -32,11 +32,11 @@ impl<N: Network> Block<N> {
         current_state_root: N::StateRoot,
         previous_committee_lookback: &Committee<N>,
         current_committee_lookback: &Committee<N>,
-        current_puzzle: &CoinbasePuzzle<N>,
-        current_epoch_challenge: &EpochChallenge<N>,
+        current_puzzle: &Puzzle<N>,
+        current_epoch_hash: N::BlockHash,
         current_timestamp: i64,
         ratified_finalize_operations: Vec<FinalizeOperation<N>>,
-    ) -> Result<(Vec<PuzzleCommitment<N>>, Vec<N::TransactionID>)> {
+    ) -> Result<(Vec<SolutionID<N>>, Vec<N::TransactionID>)> {
         // Ensure the block hash is correct.
         self.verify_hash(previous_block.height(), previous_block.hash())?;
 
@@ -64,7 +64,7 @@ impl<N: Network> Block<N> {
             expected_last_coinbase_timestamp,
             expected_block_reward,
             expected_puzzle_reward,
-        ) = self.verify_solutions(previous_block, current_puzzle, current_epoch_challenge)?;
+        ) = self.verify_solutions(previous_block, current_puzzle, current_epoch_hash)?;
 
         // Ensure the block ratifications are correct.
         self.verify_ratifications(expected_block_reward, expected_puzzle_reward)?;
@@ -151,7 +151,7 @@ impl<N: Network> Block<N> {
         previous_height: u32,
         previous_committee_lookback: &Committee<N>,
         current_committee_lookback: &Committee<N>,
-    ) -> Result<(u64, u32, i64, Vec<PuzzleCommitment<N>>, Vec<N::TransactionID>)> {
+    ) -> Result<(u64, u32, i64, Vec<SolutionID<N>>, Vec<N::TransactionID>)> {
         // Note: Do not remove this. This ensures that all blocks after genesis are quorum blocks.
         #[cfg(not(any(test, feature = "test")))]
         ensure!(self.authority.is_quorum(), "The next block must be a quorum block");
@@ -304,16 +304,11 @@ impl<N: Network> Block<N> {
     fn verify_solutions(
         &self,
         previous_block: &Block<N>,
-        current_puzzle: &CoinbasePuzzle<N>,
-        current_epoch_challenge: &EpochChallenge<N>,
+        current_puzzle: &Puzzle<N>,
+        current_epoch_hash: N::BlockHash,
     ) -> Result<(u128, u128, u64, u64, u64, i64, u64, u64)> {
         let height = self.height();
         let timestamp = self.timestamp();
-
-        // Ensure the solutions are not accepted after the block height at year 10.
-        if !self.solutions.is_empty() && height > block_height_at_year(N::BLOCK_TIME, 10) {
-            bail!("Solutions are no longer accepted after the block height at year 10.");
-        }
 
         // Ensure the number of solutions is within the allowed range.
         ensure!(
@@ -334,7 +329,7 @@ impl<N: Network> Block<N> {
         if has_duplicates(
             self.solutions
                 .as_ref()
-                .map(CoinbaseSolution::puzzle_commitments)
+                .map(PuzzleSolutions::solution_ids)
                 .into_iter()
                 .flatten()
                 .chain(self.aborted_solution_ids()),
@@ -343,72 +338,44 @@ impl<N: Network> Block<N> {
         }
 
         // Compute the combined proof target.
-        let combined_proof_target = self.solutions.to_combined_proof_target()?;
+        let combined_proof_target = match self.solutions.deref() {
+            Some(solutions) => current_puzzle.get_combined_proof_target(solutions)?,
+            None => 0u128,
+        };
 
-        let (expected_cumulative_proof_target, is_coinbase_target_reached) = match self.solutions.deref() {
-            Some(coinbase) => {
-                // Ensure the puzzle proof is valid.
-                if let Err(e) =
-                    current_puzzle.check_solutions(coinbase, current_epoch_challenge, previous_block.proof_target())
-                {
-                    bail!("Block {height} contains an invalid puzzle proof - {e}");
-                }
-
-                // Ensure that the block cumulative proof target is less than the previous block's coinbase target.
-                // Note: This is a sanity check, as the cumulative proof target resets to 0 if the
-                // coinbase target was reached in this block.
-                if self.cumulative_proof_target() >= previous_block.coinbase_target() as u128 {
-                    bail!(
-                        "The cumulative proof target in block {height} must be less than the previous coinbase target"
-                    )
-                }
-
-                // Compute the actual cumulative proof target (which can exceed the coinbase target).
-                let cumulative_proof_target =
-                    previous_block.cumulative_proof_target().saturating_add(combined_proof_target);
-                // Determine if the coinbase target is reached.
-                let is_coinbase_target_reached = cumulative_proof_target >= previous_block.coinbase_target() as u128;
-                // Compute the block cumulative proof target (which cannot exceed the coinbase target).
-                let expected_cumulative_proof_target = match is_coinbase_target_reached {
-                    true => 0u128,
-                    false => cumulative_proof_target,
-                };
-
-                (expected_cumulative_proof_target, is_coinbase_target_reached)
+        // Verify the solutions.
+        if let Some(coinbase) = self.solutions.deref() {
+            // Ensure the puzzle proof is valid.
+            if let Err(e) = current_puzzle.check_solutions(coinbase, current_epoch_hash, previous_block.proof_target())
+            {
+                bail!("Block {height} contains an invalid puzzle proof - {e}");
             }
-            None => {
-                // Determine the cumulative proof target.
-                let expected_cumulative_proof_target = previous_block.cumulative_proof_target();
 
-                (expected_cumulative_proof_target, false)
+            // Ensure that the block cumulative proof target is less than the previous block's coinbase target.
+            // Note: This is a sanity check, as the cumulative proof target resets to 0 if the
+            // coinbase target was reached in this block.
+            if self.cumulative_proof_target() >= previous_block.coinbase_target() as u128 {
+                bail!("The cumulative proof target in block {height} must be less than the previous coinbase target")
             }
         };
 
-        // Compute the expected cumulative weight.
-        let expected_cumulative_weight = previous_block.cumulative_weight().saturating_add(combined_proof_target);
-
-        // Construct the next coinbase target.
-        let expected_coinbase_target = coinbase_target(
+        // Calculate the next coinbase targets and timestamps.
+        let (
+            expected_coinbase_target,
+            expected_proof_target,
+            expected_cumulative_proof_target,
+            expected_cumulative_weight,
+            expected_last_coinbase_target,
+            expected_last_coinbase_timestamp,
+        ) = to_next_targets::<N>(
+            previous_block.cumulative_proof_target(),
+            combined_proof_target,
+            previous_block.coinbase_target(),
+            previous_block.cumulative_weight(),
             previous_block.last_coinbase_target(),
             previous_block.last_coinbase_timestamp(),
             timestamp,
-            N::ANCHOR_TIME,
-            N::NUM_BLOCKS_PER_EPOCH,
-            N::GENESIS_COINBASE_TARGET,
         )?;
-        // Ensure the proof target is correct.
-        let expected_proof_target = proof_target(expected_coinbase_target, N::GENESIS_PROOF_TARGET);
-
-        // Determine the expected last coinbase target.
-        let expected_last_coinbase_target = match is_coinbase_target_reached {
-            true => expected_coinbase_target,
-            false => previous_block.last_coinbase_target(),
-        };
-        // Determine the expected last coinbase timestamp.
-        let expected_last_coinbase_timestamp = match is_coinbase_target_reached {
-            true => timestamp,
-            false => previous_block.last_coinbase_timestamp(),
-        };
 
         // Calculate the expected coinbase reward.
         let expected_coinbase_reward = coinbase_reward(
@@ -565,11 +532,11 @@ impl<N: Network> Block<N> {
     /// Returns the IDs of the transactions and solutions that should already exist in the ledger.
     pub(super) fn check_subdag_transmissions(
         subdag: &Subdag<N>,
-        solutions: &Option<CoinbaseSolution<N>>,
-        aborted_solution_ids: &[PuzzleCommitment<N>],
+        solutions: &Option<PuzzleSolutions<N>>,
+        aborted_solution_ids: &[SolutionID<N>],
         transactions: &Transactions<N>,
         aborted_transaction_ids: &[N::TransactionID],
-    ) -> Result<(Vec<PuzzleCommitment<N>>, Vec<N::TransactionID>)> {
+    ) -> Result<(Vec<SolutionID<N>>, Vec<N::TransactionID>)> {
         // Prepare an iterator over the solution IDs.
         let mut solutions = solutions.as_ref().map(|s| s.deref()).into_iter().flatten().peekable();
         // Prepare an iterator over the unconfirmed transaction IDs.
@@ -599,7 +566,7 @@ impl<N: Network> Block<N> {
                 TransmissionID::Solution(solution_id) => {
                     match solutions.peek() {
                         // Check the next solution matches the expected solution ID.
-                        Some((_, solution)) if solution.commitment() == *solution_id => {
+                        Some((_, solution)) if solution.id() == *solution_id => {
                             // Increment the solution iterator.
                             solutions.next();
                         }

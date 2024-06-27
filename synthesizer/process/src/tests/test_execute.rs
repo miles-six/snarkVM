@@ -478,7 +478,7 @@ output r1 as token.record;",
 }
 
 #[test]
-fn test_process_execute_transfer_public() {
+fn test_process_execute_transfer_public_to_private() {
     // Initialize a new program.
     let program = Program::<CurrentNetwork>::credits().unwrap();
 
@@ -2376,7 +2376,7 @@ fn test_process_deploy_credits_program() {
     let deployment = empty_process.deploy::<CurrentAleo, _>(&program, rng).unwrap();
 
     // Ensure the deployment is valid on the empty process.
-    assert!(empty_process.verify_deployment::<CurrentAleo, _>(&deployment, rng).is_ok());
+    empty_process.verify_deployment::<CurrentAleo, _>(&deployment, rng).unwrap();
     // Ensure the deployment is not valid on the standard process.
     assert!(process.verify_deployment::<CurrentAleo, _>(&deployment, rng).is_err());
 
@@ -2400,7 +2400,7 @@ function compute:
     let deployment = empty_process.deploy::<CurrentAleo, _>(&program, rng).unwrap();
 
     // Ensure the deployment is valid on the empty process.
-    assert!(empty_process.verify_deployment::<CurrentAleo, _>(&deployment, rng).is_ok());
+    empty_process.verify_deployment::<CurrentAleo, _>(&deployment, rng).unwrap();
     // Ensure the deployment is not valid on the standard process.
     assert!(process.verify_deployment::<CurrentAleo, _>(&deployment, rng).is_err());
 }
